@@ -127,6 +127,12 @@ OV_API struct ov_context * ov_init(const struct ov_init_params * params);
 // Safe on NULL.
 OV_API void ov_free(struct ov_context * ov);
 
+// Name of the primary GGML backend selected for this context, for example
+// "Vulkan0", "Metal" or "CPU". Returns an empty string for NULL. The
+// returned pointer is owned by GGML and remains valid while the context is
+// alive; callers must not free it.
+OV_API const char * ov_backend_name(const struct ov_context * ov);
+
 // Cooperative cancellation callback. Returns true to request the
 // synthesis to abort. Polled between chunks of long-form output, so the
 // cancel granularity is roughly chunk_duration_sec.

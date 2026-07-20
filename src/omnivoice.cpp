@@ -283,6 +283,13 @@ void ov_free(struct ov_context * ov) {
     delete ov;
 }
 
+const char * ov_backend_name(const struct ov_context * ov) {
+    if (!ov || !ov->bp.backend) {
+        return "";
+    }
+    return ggml_backend_name(ov->bp.backend);
+}
+
 enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out) {
     if (!ov || !params) {
         ov_set_error("ov_synthesize: ov / params is NULL");

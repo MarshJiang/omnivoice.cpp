@@ -96,6 +96,10 @@ int main(void) {
         ov_free(dummy);
         return 2;
     }
+    if (strcmp(ov_backend_name(NULL), "") != 0) {
+        fprintf(stderr, "[Probe] ov_backend_name(NULL) was not empty\n");
+        return 10;
+    }
 
     /* ov_init(NULL) just failed -> ov_last_error() must point to a
      * non-empty thread-local string. Pointer is always valid (c_str on
