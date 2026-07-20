@@ -102,16 +102,20 @@ static ggml_backend_buffer_type_t pipeline_tts_hexagon_repack_buft(ggml_backend_
 
 bool pipeline_tts_load(PipelineTTS * pt, const char * gguf_path, BackendPair bp, bool use_fa, bool clamp_fp16) {
     *pt                = {};
-    pt->bp             = bp;
-    pt->backend        = bp.backend;
-    pt->use_flash_attn = use_fa && bp.has_gpu;
-    pt->clamp_fp16     = clamp_fp16;
+    pt->bp                     = bp;
+    pt->backend                = bp.backend;
+    pt->use_flash_attn         = use_fa && bp.has_gpu;
+    const char * backend_name  = bp.backend ? ggml_backend_name(bp.backend) : nullptr;
+    pt->flash_attn_f16_kv = pt->use_flash_attn && backend_name && strncmp(backend_name, "HTP", 3) == 0;
+    pt->clamp_fp16             = clamp_fp16;
 
     // Echo effective flags. Flash attention only activates on a GPU backend,
     // so the disabled log fires both for explicit --no-fa and for CPU only
     // runs where the request cannot be honoured.
     if (!pt->use_flash_attn) {
         ov_log(OV_LOG_INFO, "[Load] Flash attention disabled");
+    } else if (pt->flash_attn_f16_kv) {
+        ov_log(OV_LOG_INFO, "[Load] Flash attention K/V: F16 (HTP requirement)");
     }
     if (pt->clamp_fp16) {
         ov_log(OV_LOG_INFO, "[Load] FP16 clamp enabled");
@@ -325,7 +329,7 @@ std::vector<float> pipeline_tts_llm_forward(PipelineTTS *   pt,
     }
     struct ggml_tensor * hidden = qwen3_build_layers(
         gctx, cfg, pt->lm.layers, pt->lm.final_norm, inputs_embeds, t_positions, t_attn, S, pt->use_flash_attn,
-        pt->clamp_fp16, dump_hidden_dir && dump_hidden_name ? &dump_layer_indices : nullptr,
+        pt->flash_attn_f16_kv, pt->clamp_fp16, dump_hidden_dir && dump_hidden_name ? &dump_layer_indices : nullptr,
         dump_hidden_dir && dump_hidden_name ? &dump_intermediates : nullptr,
         dump_hidden_dir && dump_hidden_name ? 1 : -1, dump_hidden_dir && dump_hidden_name ? &sub_outs : nullptr);
     if (dump_hidden_dir && dump_hidden_name) {
@@ -480,6 +484,7 @@ static bool lm_batched_graph_build(PipelineTTS * pt, MaskgitBatchedCtx * ctx, in
     const int           H   = cfg.hidden_size;
     const int           B   = 1;
     const int           S   = ctx->S;
+    const bool          lm_diag = getenv("OMNIVOICE_LM_DIAG") != nullptr;
 
     if (ctx->lm_gctx) {
         static_graph_release(&ctx->lm_graph, pt->sched);
@@ -549,29 +554,34 @@ static bool lm_batched_graph_build(PipelineTTS * pt, MaskgitBatchedCtx * ctx, in
         audio_embeds_flat          = (k == 0) ? emb_k : ggml_add(gctx, audio_embeds_flat, emb_k);
     }
     ggml_set_name(text_embeds_flat, "lm_text_embeds");
-    ggml_set_output(text_embeds_flat);
     ggml_set_name(audio_embeds_flat, "lm_audio_embeds");
-    ggml_set_output(audio_embeds_flat);
+    if (lm_diag) {
+        ggml_set_output(text_embeds_flat);
+        ggml_set_output(audio_embeds_flat);
+    }
 
     struct ggml_tensor * text_embeds   = ggml_reshape_3d(gctx, text_embeds_flat, H, S, B);
     struct ggml_tensor * audio_embeds  = ggml_reshape_3d(gctx, audio_embeds_flat, H, S, B);
     struct ggml_tensor * text_branch   = ggml_mul(gctx, text_embeds, t_inv_mask);
     struct ggml_tensor * audio_branch  = ggml_mul(gctx, audio_embeds, t_mask);
     ggml_set_name(text_branch, "lm_text_branch");
-    ggml_set_output(text_branch);
     ggml_set_name(audio_branch, "lm_audio_branch");
-    ggml_set_output(audio_branch);
 
     struct ggml_tensor * inputs_embeds = ggml_add(gctx, text_branch, audio_branch);
     ggml_set_name(inputs_embeds, "lm_inputs_embeds");
-    ggml_set_output(inputs_embeds);
+    if (lm_diag) {
+        ggml_set_output(text_branch);
+        ggml_set_output(audio_branch);
+        ggml_set_output(inputs_embeds);
+    }
 
     // 28L Qwen3 stack with B=1. Layer 0 exposes its real operator outputs so
     // the first invalid HTP kernel can be identified without changing math.
     Qwen3LayerOpTaps l0_taps;
     struct ggml_tensor * hidden =
         qwen3_build_layers(gctx, cfg, pt->lm.layers, pt->lm.final_norm, inputs_embeds, t_positions, t_attn, S,
-                           pt->use_flash_attn, pt->clamp_fp16, nullptr, nullptr, -1, nullptr, 0, &l0_taps, B);
+                           pt->use_flash_attn, pt->flash_attn_f16_kv, pt->clamp_fp16, nullptr, nullptr, -1, nullptr, 0,
+                           lm_diag ? &l0_taps : nullptr, B);
 
     ctx->lm_l0_tensors.clear();
     auto keep_l0_tap = [&](struct ggml_tensor * tensor, const char * name) {
@@ -581,32 +591,36 @@ static bool lm_batched_graph_build(PipelineTTS * pt, MaskgitBatchedCtx * ctx, in
             ctx->lm_l0_tensors.push_back(tensor);
         }
     };
-    keep_l0_tap(l0_taps.norm1, "l0_norm1");
-    keep_l0_tap(l0_taps.qkv_projection, "l0_qkv_projection");
-    keep_l0_tap(l0_taps.qk_projection, "l0_qk_projection");
-    keep_l0_tap(l0_taps.q_projection, "l0_q_projection");
-    keep_l0_tap(l0_taps.k_projection, "l0_k_projection");
-    keep_l0_tap(l0_taps.v_projection, "l0_v_projection");
-    keep_l0_tap(l0_taps.q_norm, "l0_q_norm");
-    keep_l0_tap(l0_taps.k_norm, "l0_k_norm");
-    keep_l0_tap(l0_taps.q_rope, "l0_q_rope");
-    keep_l0_tap(l0_taps.k_rope, "l0_k_rope");
-    keep_l0_tap(l0_taps.attention_scores, "l0_attention_scores");
-    keep_l0_tap(l0_taps.attention_probs, "l0_attention_probs");
-    keep_l0_tap(l0_taps.attention_value_mix, "l0_attention_value_mix");
-    keep_l0_tap(l0_taps.attention_context, "l0_attention_context");
-    keep_l0_tap(l0_taps.o_projection, "l0_o_projection");
-    keep_l0_tap(l0_taps.attention_residual, "l0_attention_residual");
-    keep_l0_tap(l0_taps.norm2, "l0_norm2");
-    keep_l0_tap(l0_taps.gate_up_projection, "l0_gate_up_projection");
-    keep_l0_tap(l0_taps.gate_projection, "l0_gate_projection");
-    keep_l0_tap(l0_taps.up_projection, "l0_up_projection");
-    keep_l0_tap(l0_taps.swiglu, "l0_swiglu");
-    keep_l0_tap(l0_taps.down_projection, "l0_down_projection");
-    keep_l0_tap(l0_taps.layer_output, "l0_layer_output");
+    if (lm_diag) {
+        keep_l0_tap(l0_taps.norm1, "l0_norm1");
+        keep_l0_tap(l0_taps.qkv_projection, "l0_qkv_projection");
+        keep_l0_tap(l0_taps.qk_projection, "l0_qk_projection");
+        keep_l0_tap(l0_taps.q_projection, "l0_q_projection");
+        keep_l0_tap(l0_taps.k_projection, "l0_k_projection");
+        keep_l0_tap(l0_taps.v_projection, "l0_v_projection");
+        keep_l0_tap(l0_taps.q_norm, "l0_q_norm");
+        keep_l0_tap(l0_taps.k_norm, "l0_k_norm");
+        keep_l0_tap(l0_taps.q_rope, "l0_q_rope");
+        keep_l0_tap(l0_taps.k_rope, "l0_k_rope");
+        keep_l0_tap(l0_taps.attention_scores, "l0_attention_scores");
+        keep_l0_tap(l0_taps.attention_probs, "l0_attention_probs");
+        keep_l0_tap(l0_taps.attention_value_mix, "l0_attention_value_mix");
+        keep_l0_tap(l0_taps.attention_context, "l0_attention_context");
+        keep_l0_tap(l0_taps.o_projection, "l0_o_projection");
+        keep_l0_tap(l0_taps.attention_residual, "l0_attention_residual");
+        keep_l0_tap(l0_taps.norm2, "l0_norm2");
+        keep_l0_tap(l0_taps.gate_up_projection, "l0_gate_up_projection");
+        keep_l0_tap(l0_taps.gate_projection, "l0_gate_projection");
+        keep_l0_tap(l0_taps.up_projection, "l0_up_projection");
+        keep_l0_tap(l0_taps.swiglu, "l0_swiglu");
+        keep_l0_tap(l0_taps.down_projection, "l0_down_projection");
+        keep_l0_tap(l0_taps.layer_output, "l0_layer_output");
+    }
 
     ggml_set_name(hidden, "lm_final_hidden");
-    ggml_set_output(hidden);
+    if (lm_diag) {
+        ggml_set_output(hidden);
+    }
 
     // audio_heads readout. hidden is [H, S, 1], audio_heads is [H, V*K],
     // mul_mat returns [V*K, S, 1] which we reshape to [V, K, S, 1].
@@ -649,6 +663,38 @@ static bool lm_batched_graph_build(PipelineTTS * pt, MaskgitBatchedCtx * ctx, in
         return false;
     }
 
+    int primary = 0;
+    int cpu     = 0;
+    int other   = 0;
+    int cpu_ops[GGML_OP_COUNT] = { 0 };
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        struct ggml_tensor * node = ggml_graph_node(graph, i);
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(pt->sched, node);
+        if (backend == pt->backend) {
+            primary++;
+        } else if (backend == pt->bp.cpu_backend) {
+            cpu++;
+            if (node->op >= 0 && node->op < GGML_OP_COUNT) {
+                cpu_ops[node->op]++;
+            }
+        } else {
+            other++;
+        }
+    }
+    ov_log(OV_LOG_INFO, "[LM-Backend] primary(%s)=%d fallback-CPU=%d other=%d total=%d",
+           ggml_backend_name(pt->backend), primary, cpu, other, n_nodes);
+    std::string cpu_summary = "[LM-Backend-CPU]";
+    for (int op = 0; op < GGML_OP_COUNT; ++op) {
+        if (cpu_ops[op] > 0) {
+            cpu_summary += ' ';
+            cpu_summary += ggml_op_name((enum ggml_op) op);
+            cpu_summary += '=';
+            cpu_summary += std::to_string(cpu_ops[op]);
+        }
+    }
+    ov_log(OV_LOG_INFO, "%s", cpu_summary.c_str());
+
     ctx->lm_gctx          = gctx;
     ctx->lm_gf            = graph;
     ctx->lm_text_ids      = t_text_ids;
@@ -669,6 +715,7 @@ static bool lm_batched_graph_build(PipelineTTS * pt, MaskgitBatchedCtx * ctx, in
     ctx->lm_key_K         = K;
     ctx->lm_key_T_audio   = T_audio;
     ctx->lm_built        = true;
+    ctx->lm_diag         = lm_diag;
     ctx->lm_stats_logged = false;
     return true;
 }
@@ -817,7 +864,7 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
             return {};
         }
 
-        if (b == 0 && !ctx->lm_stats_logged) {
+        if (b == 0 && ctx->lm_diag && !ctx->lm_stats_logged) {
             ov_log(OV_LOG_INFO, "[LM-Diag] embedding types: text=%s audio=%s", ggml_type_name(pt->lm.embed_tokens->type),
                    ggml_type_name(pt->lm.audio_embeddings->type));
             lm_log_f32_tensor_stats("text_embeds", ctx->lm_text_embeds);
@@ -870,6 +917,7 @@ void pipeline_tts_llm_batched_ctx_free(PipelineTTS * pt, MaskgitBatchedCtx * ctx
     ctx->lm_logits       = nullptr;
     ctx->lm_l0_tensors.clear();
     ctx->lm_built        = false;
+    ctx->lm_diag         = false;
     ctx->lm_stats_logged = false;
 }
 

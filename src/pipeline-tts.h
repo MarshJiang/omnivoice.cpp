@@ -44,10 +44,12 @@ struct PipelineTTS {
     ggml_backend_t       backend;
     ggml_backend_sched_t sched;
 
-    // Flash attention is enabled when a GPU backend is present and not
-    // disabled by --no-fa. FP16 clamp is opt-in via --clamp-fp16 to avoid
-    // overflow on sub-Ampere CUDA where matmul accumulates in FP16.
+    // Flash attention is enabled when an accelerator backend is present and
+    // not disabled by --no-fa. Hexagon additionally requires F16 K/V; other
+    // backends retain their original F32 K/V graph. FP16 clamp is opt-in via
+    // --clamp-fp16 to avoid overflow on sub-Ampere CUDA.
     bool use_flash_attn;
+    bool flash_attn_f16_kv;
     bool clamp_fp16;
 };
 
@@ -120,6 +122,7 @@ struct MaskgitBatchedCtx {
     int                   lm_key_K        = 0;
     int                   lm_key_T_audio  = -1;
     bool                  lm_built        = false;
+    bool                  lm_diag         = false;
     bool                  lm_stats_logged = false;
 };
 

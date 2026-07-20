@@ -157,10 +157,11 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
                                                   struct ggml_tensor *  positions,  // [S] int32
                                                   struct ggml_tensor *  mask,
                                                   int                   S,
-                                                  bool                  use_flash_attn = true,
-                                                  bool                  clamp_fp16     = false,
-                                                  Qwen3LayerOpTaps *    taps           = nullptr,
-                                                  int                   B              = 1) {
+                                                  bool                  use_flash_attn      = true,
+                                                  bool                  flash_attn_f16_kv   = false,
+                                                  bool                  clamp_fp16          = false,
+                                                  Qwen3LayerOpTaps *    taps                = nullptr,
+                                                  int                   B                   = 1) {
     int D   = c.head_dim;
     int Nh  = c.n_heads;
     int Nkv = c.n_kv_heads;
@@ -248,6 +249,13 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
     k = ggml_permute(ctx, k, 0, 2, 1, 3);
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
+    // Hexagon flash attention consumes F16 K/V while retaining F32 Q and
+    // output accumulation. Other backends keep their existing K/V type.
+    if (use_flash_attn && flash_attn_f16_kv) {
+        k = ggml_cast(ctx, k, GGML_TYPE_F16);
+        v = ggml_cast(ctx, v, GGML_TYPE_F16);
+    }
+
     // Clamp V before attention: sub-Ampere tensor cores accumulate in FP16,
     // V projection can overflow to inf which corrupts all subsequent attention.
     if (clamp_fp16) {
@@ -324,11 +332,12 @@ static struct ggml_tensor * qwen3_build_layer(struct ggml_context *             
                                               struct ggml_tensor *                positions,
                                               struct ggml_tensor *                mask,
                                               int                                 S,
-                                              bool                                use_flash_attn = true,
-                                              bool                                clamp_fp16     = false,
-                                              std::vector<struct ggml_tensor *> * sub_outs       = nullptr,
-                                              Qwen3LayerOpTaps *                  op_taps        = nullptr,
-                                              int                                 B              = 1) {
+                                              bool                                use_flash_attn      = true,
+                                              bool                                flash_attn_f16_kv = false,
+                                              bool                                clamp_fp16          = false,
+                                              std::vector<struct ggml_tensor *> * sub_outs            = nullptr,
+                                              Qwen3LayerOpTaps *                  op_taps             = nullptr,
+                                              int                                 B                   = 1) {
     // Self-attention block
     struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
     if (op_taps) {
@@ -338,7 +347,8 @@ static struct ggml_tensor * qwen3_build_layer(struct ggml_context *             
         sub_outs->push_back(norm);
     }
     struct ggml_tensor * attn =
-        qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn, clamp_fp16, op_taps, B);
+        qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn, flash_attn_f16_kv, clamp_fp16,
+                              op_taps, B);
     if (sub_outs) {
         sub_outs->push_back(attn);
     }
@@ -388,6 +398,7 @@ static struct ggml_tensor * qwen3_build_layers(struct ggml_context *            
                                                struct ggml_tensor *                mask,
                                                int                                 S,
                                                bool                                use_flash_attn       = true,
+                                               bool                                flash_attn_f16_kv    = false,
                                                bool                                clamp_fp16           = false,
                                                const std::vector<int> *            intermediate_indices = nullptr,
                                                std::vector<struct ggml_tensor *> * intermediates        = nullptr,
@@ -399,8 +410,8 @@ static struct ggml_tensor * qwen3_build_layers(struct ggml_context *            
     for (int i = 0; i < c.n_layers; i++) {
         std::vector<struct ggml_tensor *> * subs_for_this = (i == dump_sub_layer) ? sub_outs : nullptr;
         Qwen3LayerOpTaps *                  taps_for_this = (i == op_tap_layer) ? op_taps : nullptr;
-        hidden = qwen3_build_layer(ctx, c, &layers[i], hidden, positions, mask, S, use_flash_attn, clamp_fp16,
-                                   subs_for_this, taps_for_this, B);
+        hidden = qwen3_build_layer(ctx, c, &layers[i], hidden, positions, mask, S, use_flash_attn,
+                                   flash_attn_f16_kv, clamp_fp16, subs_for_this, taps_for_this, B);
         if (intermediate_indices && intermediates) {
             for (int idx : *intermediate_indices) {
                 if (idx == i) {

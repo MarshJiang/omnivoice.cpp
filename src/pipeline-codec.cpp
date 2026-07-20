@@ -24,11 +24,34 @@
 #include "ggml-backend.h"
 #include "ggml.h"
 #include "ov-error.h"
+#include "timer.h"
 #include "utf8.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+static void pipeline_codec_log_backend_split(
+    const PipelineCodec * pc,
+    struct ggml_cgraph * graph,
+    const char * stage) {
+    int primary = 0;
+    int cpu     = 0;
+    int other   = 0;
+    const int n_nodes = ggml_graph_n_nodes(graph);
+    for (int i = 0; i < n_nodes; ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(pc->sched, ggml_graph_node(graph, i));
+        if (backend == pc->backend) {
+            primary++;
+        } else if (backend == pc->bp.cpu_backend) {
+            cpu++;
+        } else {
+            other++;
+        }
+    }
+    ov_log(OV_LOG_INFO, "[Encode-Backend] %s: primary(%s)=%d fallback-CPU=%d other=%d total=%d", stage,
+           ggml_backend_name(pc->backend), primary, cpu, other, n_nodes);
+}
 
 bool pipeline_codec_load(PipelineCodec * pc, const char * gguf_path, BackendPair bp) {
     *pc                    = {};
@@ -203,6 +226,8 @@ std::vector<float> pipeline_codec_decode(PipelineCodec * pc, const int32_t * cod
         return {};
     }
 
+    BackendCodecCPUThreadScope cpu_threads(pc->bp.cpu_backend);
+
     // Compute graph context: holds tensor descriptors for the forward pass.
     // 4096 nodes leaves ample headroom (DAC alone has ~150 ops).
     const int    n_max_nodes    = 4096;
@@ -359,6 +384,17 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
         return {};
     }
 
+    BackendCodecCPUThreadScope cpu_threads(pc->bp.cpu_backend);
+
+    Timer  total_timer;
+    Timer  stage_timer;
+    double resample_ms  = 0.0;
+    double hubert_ms    = 0.0;
+    double transpose_ms = 0.0;
+    double semantic_ms  = 0.0;
+    double dac_ms       = 0.0;
+    double rvq_ms       = 0.0;
+
     // Step 1: resample 24 kHz -> 16 kHz mono and pad with 160 zeros on each
     // side, matching HiggsAudioV2 _extract_semantic_features.
     int     n_16k     = 0;
@@ -376,12 +412,16 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
     std::vector<float> audio_16k_padded((size_t) n_padded, 0.0f);
     std::memcpy(audio_16k_padded.data() + 160, resampled, (size_t) n_16k * sizeof(float));
     free(resampled);
+    resample_ms = stage_timer.ms();
+    stage_timer.reset();
 
     // Step 2: full HuBERT features pipeline -> e_semantic_input (768, T_s).
     std::vector<float> features = pipeline_codec_hubert_features_test(pc, audio_16k_padded.data(), n_padded, dump_dir);
     if (features.empty()) {
         return {};
     }
+    hubert_ms = stage_timer.ms();
+    stage_timer.reset();
     const int T_s = (int) (features.size() / 768);
 
     if (dump_dir) {
@@ -400,6 +440,8 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
             features_t[t + (size_t) k * T_s] = features[k + (size_t) t * SEM_HIDDEN];
         }
     }
+    transpose_ms = stage_timer.ms();
+    stage_timer.reset();
 
     // Step 3: SemanticEncoder refines the features in-place (no temporal
     // downsample), output stays T-first (T_s, 768).
@@ -407,6 +449,8 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
     if (e_semantic.empty()) {
         return {};
     }
+    semantic_ms = stage_timer.ms();
+    stage_timer.reset();
 
     // Step 4: DAC encoder. Decide pad branch from analytical T_a vs measured
     // T_s. Upstream uses self.pad = hop_length // 2 = 480 zeros on each side.
@@ -423,6 +467,8 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
     if (e_acoustic.empty()) {
         return {};
     }
+    dac_ms = stage_timer.ms();
+    stage_timer.reset();
     const int T_a = (int) (e_acoustic.size() / 256);
     if (T_a != T_s) {
         ov_log(OV_LOG_ERROR, "[Encode] post-DAC T_a=%d does not match HuBERT T_s=%d", T_a, T_s);
@@ -496,6 +542,7 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
         ggml_free(gctx);
         return {};
     }
+    pipeline_codec_log_backend_split(pc, graph, "RVQ");
 
     ggml_backend_tensor_set(ac_t, e_acoustic.data(), 0, e_acoustic.size() * sizeof(float));
     ggml_backend_tensor_set(sem_t, e_semantic.data(), 0, e_semantic.size() * sizeof(float));
@@ -531,6 +578,10 @@ std::vector<int32_t> pipeline_codec_encode(PipelineCodec * pc,
 
     ggml_backend_sched_reset(pc->sched);
     ggml_free(gctx);
+    rvq_ms = stage_timer.ms();
+    ov_log(OV_LOG_INFO,
+           "[Perf] CodecEncode %.1f ms: resample=%.1f HuBERT=%.1f transpose=%.1f semantic=%.1f DAC=%.1f RVQ=%.1f",
+           total_timer.ms(), resample_ms, hubert_ms, transpose_ms, semantic_ms, dac_ms, rvq_ms);
     return codes;
 }
 
@@ -593,6 +644,7 @@ static std::vector<float> pipeline_codec_dac_enc_test(PipelineCodec * pc, const 
         ggml_free(gctx);
         return {};
     }
+    pipeline_codec_log_backend_split(pc, graph, "DAC");
 
     ggml_backend_tensor_set(audio_in, audio_f32, 0, (size_t) n_samples * sizeof(float));
 
@@ -645,6 +697,7 @@ static std::vector<float> pipeline_codec_sem_enc_test(PipelineCodec * pc, const 
         ggml_free(gctx);
         return {};
     }
+    pipeline_codec_log_backend_split(pc, graph, "Semantic");
 
     ggml_backend_tensor_set(sem_in, features_f32, 0, (size_t) n_frames * SEM_HIDDEN * sizeof(float));
 
@@ -754,6 +807,7 @@ static std::vector<float> pipeline_codec_hubert_features_test(PipelineCodec * pc
         ggml_free(gctx);
         return {};
     }
+    pipeline_codec_log_backend_split(pc, graph, "HuBERT");
 
     ggml_backend_tensor_set(audio, audio_f32, 0, (size_t) n_samples * sizeof(float));
 

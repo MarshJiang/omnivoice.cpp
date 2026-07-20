@@ -24,13 +24,51 @@ struct BackendPair {
 static BackendPair g_backend_cache = {};
 static int         g_backend_refs  = 0;
 
-// Physical core count heuristic (logical / 2 for HT/SMT).
-// Used for GGML CPU thread count: GEMM shares SIMD units across hyperthreads,
-// so one thread per physical core is optimal.
+// Conservative default for the CPU fallback used alongside an accelerator.
+// Keeping half the logical cores free avoids competing with HTP/GPU dispatch
+// and the application UI on heterogeneous systems.
 static int backend_cpu_n_threads(void) {
     int n = (int) std::thread::hardware_concurrency() / 2;
     return n > 0 ? n : 1;
 }
+
+// Android reports physical cores rather than SMT siblings. Codec graphs run
+// entirely on CPU while HTP is idle, so they can use all available cores.
+static int backend_codec_cpu_n_threads(void) {
+#if defined(__ANDROID__)
+    int n = (int) std::thread::hardware_concurrency();
+    return n > 0 ? n : 1;
+#else
+    return backend_cpu_n_threads();
+#endif
+}
+
+static void backend_cpu_set_n_threads(ggml_backend_t cpu, int n_threads) {
+    if (!cpu) {
+        return;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(cpu);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
+    if (reg) {
+        auto set_fn =
+            (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
+        if (set_fn) {
+            set_fn(cpu, n_threads);
+        }
+    }
+}
+
+struct BackendCodecCPUThreadScope {
+    explicit BackendCodecCPUThreadScope(ggml_backend_t cpu) : cpu(cpu) {
+        backend_cpu_set_n_threads(cpu, backend_codec_cpu_n_threads());
+    }
+
+    ~BackendCodecCPUThreadScope() {
+        backend_cpu_set_n_threads(cpu, backend_cpu_n_threads());
+    }
+
+    ggml_backend_t cpu;
+};
 
 // Standalone CPU backend via Registry API (DL-safe, no ggml-cpu.h needed).
 // Sets thread count via proc address since ggml_backend_cpu_device_init_backend
@@ -49,15 +87,7 @@ static ggml_backend_t cpu_backend_new(int n_threads) {
         return NULL;
     }
 
-    ggml_backend_dev_t dev = ggml_backend_get_device(cpu);
-    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : NULL;
-    if (reg) {
-        auto set_fn =
-            (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
-        if (set_fn) {
-            set_fn(cpu, n_threads);
-        }
-    }
+    backend_cpu_set_n_threads(cpu, n_threads);
     return cpu;
 }
 
