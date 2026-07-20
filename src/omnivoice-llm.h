@@ -48,9 +48,10 @@ struct OmniVoiceLM {
 };
 
 // Load OmniVoiceLM weights from an already opened GGUF.
-// wctx is shared with the higher level pipeline. Caller calls wctx_alloc
-// once all modules are loaded, then closes the GGUF.
-static bool omnivoice_lm_load(OmniVoiceLM * m, const GGUFModel & gf, WeightCtx * wctx) {
+// wctx holds the Transformer and output-head weights. embed_wctx may point to
+// the same context, or to a CPU-owned context when the accelerator cannot run
+// quantized GET_ROWS without rewriting the embedding storage layout.
+static bool omnivoice_lm_load(OmniVoiceLM * m, const GGUFModel & gf, WeightCtx * wctx, WeightCtx * embed_wctx) {
     *m = {};
 
     // Backbone config from canonical KV namespace omnivoice-lm.*
@@ -88,10 +89,10 @@ static bool omnivoice_lm_load(OmniVoiceLM * m, const GGUFModel & gf, WeightCtx *
     }
 
     // Tensors. Backbone uses prefix llm.layers.{i}, embeddings/norm at llm.* root.
-    m->embed_tokens = gf_load_tensor(wctx, gf, "llm.embed_tokens.weight");
+    m->embed_tokens = gf_load_tensor(embed_wctx, gf, "llm.embed_tokens.weight");
     m->final_norm   = gf_load_tensor_f32(wctx, gf, "llm.norm.weight");
 
-    m->audio_embeddings = gf_load_tensor(wctx, gf, "audio_embeddings.weight");
+    m->audio_embeddings = gf_load_tensor(embed_wctx, gf, "audio_embeddings.weight");
     m->audio_heads      = gf_load_tensor(wctx, gf, "audio_heads.weight");
 
     fprintf(stderr, "[LM-Load] Loaded: %dL H=%d FFN=%d Nh=%d Nkv=%d D=%d theta=%.0f eps=%.0e", m->cfg.n_layers,

@@ -56,6 +56,34 @@ struct Qwen3Layer {
     struct ggml_tensor * down_proj;  // [FFN, H]
 };
 
+// Optional layer-level diagnostic taps. These point at the real graph nodes;
+// callers decide which tensors to retain as outputs and how to inspect them.
+struct Qwen3LayerOpTaps {
+    struct ggml_tensor * norm1               = nullptr;
+    struct ggml_tensor * qkv_projection      = nullptr;
+    struct ggml_tensor * qk_projection       = nullptr;
+    struct ggml_tensor * q_projection        = nullptr;
+    struct ggml_tensor * k_projection        = nullptr;
+    struct ggml_tensor * v_projection        = nullptr;
+    struct ggml_tensor * q_norm              = nullptr;
+    struct ggml_tensor * k_norm              = nullptr;
+    struct ggml_tensor * q_rope              = nullptr;
+    struct ggml_tensor * k_rope              = nullptr;
+    struct ggml_tensor * attention_scores    = nullptr;
+    struct ggml_tensor * attention_probs     = nullptr;
+    struct ggml_tensor * attention_value_mix = nullptr;
+    struct ggml_tensor * attention_context   = nullptr;
+    struct ggml_tensor * o_projection        = nullptr;
+    struct ggml_tensor * attention_residual  = nullptr;
+    struct ggml_tensor * norm2               = nullptr;
+    struct ggml_tensor * gate_up_projection  = nullptr;
+    struct ggml_tensor * gate_projection     = nullptr;
+    struct ggml_tensor * up_projection       = nullptr;
+    struct ggml_tensor * swiglu              = nullptr;
+    struct ggml_tensor * down_projection     = nullptr;
+    struct ggml_tensor * layer_output        = nullptr;
+};
+
 // Helpers (pure graph ops, no side effects)
 static struct ggml_tensor * qwen3_f32(struct ggml_context * ctx, struct ggml_tensor * t) {
     if (t->type == GGML_TYPE_F32) {
@@ -84,11 +112,21 @@ static struct ggml_tensor * qwen3_attn_f32(struct ggml_context * ctx,
                                            struct ggml_tensor *  k,
                                            struct ggml_tensor *  v,
                                            struct ggml_tensor *  mask,
-                                           float                 scale) {
+                                           float                 scale,
+                                           Qwen3LayerOpTaps *    taps = nullptr) {
     struct ggml_tensor * scores = ggml_mul_mat(ctx, k, q);
+    if (taps) {
+        taps->attention_scores = scores;
+    }
     scores                      = ggml_soft_max_ext(ctx, scores, mask, scale, 0.0f);
+    if (taps) {
+        taps->attention_probs = scores;
+    }
     struct ggml_tensor * vt     = ggml_cont(ctx, ggml_transpose(ctx, v));
     struct ggml_tensor * out    = ggml_mul_mat(ctx, vt, scores);
+    if (taps) {
+        taps->attention_value_mix = out;
+    }
     return ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3));
 }
 
@@ -121,6 +159,7 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
                                                   int                   S,
                                                   bool                  use_flash_attn = true,
                                                   bool                  clamp_fp16     = false,
+                                                  Qwen3LayerOpTaps *    taps           = nullptr,
                                                   int                   B              = 1) {
     int D   = c.head_dim;
     int Nh  = c.n_heads;
@@ -133,6 +172,9 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
     int                 kv_dim = Nkv * D;
     if (ly->qkv) {
         struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, x);
+        if (taps) {
+            taps->qkv_projection = qkv;
+        }
         if (B == 1) {
             q = ggml_cont(ctx, ggml_view_2d(ctx, qkv, q_dim, S, qkv->nb[1], 0));
             k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, S, qkv->nb[1], (size_t) q_dim * qkv->nb[0]));
@@ -146,6 +188,9 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
         }
     } else if (ly->qk) {
         struct ggml_tensor * qk = qwen3_linear(ctx, ly->qk, x);
+        if (taps) {
+            taps->qk_projection = qk;
+        }
         if (B == 1) {
             q = ggml_cont(ctx, ggml_view_2d(ctx, qk, q_dim, S, qk->nb[1], 0));
             k = ggml_cont(ctx, ggml_view_2d(ctx, qk, kv_dim, S, qk->nb[1], (size_t) q_dim * qk->nb[0]));
@@ -158,6 +203,11 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
         q = qwen3_linear(ctx, ly->q_proj, x);
         k = qwen3_linear(ctx, ly->k_proj, x);
         v = qwen3_linear(ctx, ly->v_proj, x);
+    }
+    if (taps) {
+        taps->q_projection = q;
+        taps->k_projection = k;
+        taps->v_projection = v;
     }
 
     // 2) Reshape to heads. In 3D mode keep the existing [D, X, S] layout. In
@@ -178,12 +228,20 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
     q = ggml_mul(ctx, q, qwen3_f32(ctx, ly->q_norm));
     k = ggml_rms_norm(ctx, k, c.rms_norm_eps);
     k = ggml_mul(ctx, k, qwen3_f32(ctx, ly->k_norm));
+    if (taps) {
+        taps->q_norm = q;
+        taps->k_norm = k;
+    }
 
     // 4) RoPE
     // ggml pitfall: mode=2 (NEOX half-split [i, i+D/2]), NOT mode=0 (consecutive [2i, 2i+1])
     // Python ref: rope_batch_kernel pairs ptr[d] with ptr[d+half] = NEOX
     q = ggml_rope_ext(ctx, q, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
     k = ggml_rope_ext(ctx, k, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+    if (taps) {
+        taps->q_rope = q;
+        taps->k_rope = k;
+    }
 
     // 5) Permute for flash_attn_ext: [D, X, S(, B)] -> [D, S, X(, B)]
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
@@ -199,7 +257,7 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
     // 6) Attention (flash or F32 manual fallback)
     float                scale = 1.0f / sqrtf((float) D);
     struct ggml_tensor * attn  = use_flash_attn ? ggml_flash_attn_ext(ctx, q, k, v, mask, scale, 0.0f, 0.0f) :
-                                                  qwen3_attn_f32(ctx, q, k, v, mask, scale);
+                                                  qwen3_attn_f32(ctx, q, k, v, mask, scale, taps);
     if (use_flash_attn) {
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     }
@@ -210,27 +268,49 @@ static struct ggml_tensor * qwen3_build_self_attn(struct ggml_context * ctx,
     } else {
         attn = ggml_reshape_3d(ctx, attn, Nh * D, S, B);
     }
+    if (taps) {
+        taps->attention_context = attn;
+    }
 
     // 8) O projection
-    return qwen3_linear(ctx, ly->o_proj, attn);
+    struct ggml_tensor * out = qwen3_linear(ctx, ly->o_proj, attn);
+    if (taps) {
+        taps->o_projection = out;
+    }
+    return out;
 }
 
 // MLP: SwiGLU (fused gate+up or separate)
 static struct ggml_tensor * qwen3_build_mlp(struct ggml_context * ctx,
                                             Qwen3Layer *          ly,
                                             struct ggml_tensor *  x,  // [H, S]
-                                            int                   S) {
+                                            int                   S,
+                                            Qwen3LayerOpTaps *    taps = nullptr) {
     (void) S;
     struct ggml_tensor * ff;
     if (ly->gate_up) {
         struct ggml_tensor * gu = qwen3_linear(ctx, ly->gate_up, x);
+        if (taps) {
+            taps->gate_up_projection = gu;
+        }
         ff                      = ggml_swiglu(ctx, gu);
     } else {
         struct ggml_tensor * gate = qwen3_linear(ctx, ly->gate_proj, x);
         struct ggml_tensor * up   = qwen3_linear(ctx, ly->up_proj, x);
+        if (taps) {
+            taps->gate_projection = gate;
+            taps->up_projection   = up;
+        }
         ff                        = ggml_swiglu_split(ctx, gate, up);
     }
-    return qwen3_linear(ctx, ly->down_proj, ff);
+    if (taps) {
+        taps->swiglu = ff;
+    }
+    struct ggml_tensor * out = qwen3_linear(ctx, ly->down_proj, ff);
+    if (taps) {
+        taps->down_projection = out;
+    }
+    return out;
 }
 
 // Single layer: input [H, S(, B)] -> output [H, S(, B)]
@@ -247,14 +327,18 @@ static struct ggml_tensor * qwen3_build_layer(struct ggml_context *             
                                               bool                                use_flash_attn = true,
                                               bool                                clamp_fp16     = false,
                                               std::vector<struct ggml_tensor *> * sub_outs       = nullptr,
+                                              Qwen3LayerOpTaps *                  op_taps        = nullptr,
                                               int                                 B              = 1) {
     // Self-attention block
     struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
+    if (op_taps) {
+        op_taps->norm1 = norm;
+    }
     if (sub_outs) {
         sub_outs->push_back(norm);
     }
     struct ggml_tensor * attn =
-        qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn, clamp_fp16, B);
+        qwen3_build_self_attn(ctx, c, ly, norm, positions, mask, S, use_flash_attn, clamp_fp16, op_taps, B);
     if (sub_outs) {
         sub_outs->push_back(attn);
     }
@@ -262,19 +346,28 @@ static struct ggml_tensor * qwen3_build_layer(struct ggml_context *             
     if (clamp_fp16) {
         hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
     }
+    if (op_taps) {
+        op_taps->attention_residual = hidden;
+    }
 
     // MLP block
     norm = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
+    if (op_taps) {
+        op_taps->norm2 = norm;
+    }
     if (sub_outs) {
         sub_outs->push_back(norm);
     }
-    struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, S);
+    struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, S, op_taps);
     if (sub_outs) {
         sub_outs->push_back(mlp);
     }
     hidden = ggml_add(ctx, hidden, mlp);
     if (clamp_fp16) {
         hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
+    }
+    if (op_taps) {
+        op_taps->layer_output = hidden;
     }
 
     return hidden;
@@ -300,11 +393,14 @@ static struct ggml_tensor * qwen3_build_layers(struct ggml_context *            
                                                std::vector<struct ggml_tensor *> * intermediates        = nullptr,
                                                int                                 dump_sub_layer       = -1,
                                                std::vector<struct ggml_tensor *> * sub_outs             = nullptr,
+                                               int                                 op_tap_layer         = -1,
+                                               Qwen3LayerOpTaps *                  op_taps              = nullptr,
                                                int                                 B                    = 1) {
     for (int i = 0; i < c.n_layers; i++) {
         std::vector<struct ggml_tensor *> * subs_for_this = (i == dump_sub_layer) ? sub_outs : nullptr;
+        Qwen3LayerOpTaps *                  taps_for_this = (i == op_tap_layer) ? op_taps : nullptr;
         hidden = qwen3_build_layer(ctx, c, &layers[i], hidden, positions, mask, S, use_flash_attn, clamp_fp16,
-                                   subs_for_this, B);
+                                   subs_for_this, taps_for_this, B);
         if (intermediate_indices && intermediates) {
             for (int idx : *intermediate_indices) {
                 if (idx == i) {

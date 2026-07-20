@@ -11,9 +11,11 @@
 //   wctx_alloc(&wctx, backend);
 
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
 #include "ggml.h"
 
 #include <cstddef>
+#include <cstring>
 #include <cstdio>
 #include <memory>
 #include <vector>
@@ -50,8 +52,8 @@ static void wctx_init(WeightCtx * wctx, int n_tensors) {
     wctx->pending.reserve(n_tensors);
 }
 
-static bool wctx_alloc(WeightCtx * wctx, ggml_backend_t backend) {
-    wctx->buffer = ggml_backend_alloc_ctx_tensors(wctx->ctx, backend);
+static bool wctx_alloc_from_buft(WeightCtx * wctx, ggml_backend_buffer_type_t buft) {
+    wctx->buffer = ggml_backend_alloc_ctx_tensors_from_buft(wctx->ctx, buft);
     if (!wctx->buffer) {
         fprintf(stderr, "[WeightCtx] FATAL: failed to allocate backend buffer\n");
         return false;
@@ -60,15 +62,56 @@ static bool wctx_alloc(WeightCtx * wctx, ggml_backend_t backend) {
     // backend based on weight location (avoids fallback through expansion).
     ggml_backend_buffer_set_usage(wctx->buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     size_t total = 0;
-    for (auto & pc : wctx->pending) {
-        ggml_backend_tensor_set(pc.tensor, pc.src, pc.offset, pc.nbytes);
-        total += pc.nbytes;
+    for (size_t i = 0; i < wctx->pending.size();) {
+        const struct ggml_tensor * tensor = wctx->pending[i].tensor;
+        size_t                     j      = i + 1;
+        while (j < wctx->pending.size() && wctx->pending[j].tensor == tensor) {
+            j++;
+        }
+
+        const size_t tensor_bytes = ggml_nbytes(tensor);
+        const bool   whole_write  = j == i + 1 && wctx->pending[i].offset == 0 &&
+                                   wctx->pending[i].nbytes == tensor_bytes;
+        if (whole_write) {
+            const auto & pc = wctx->pending[i];
+            ggml_backend_tensor_set(pc.tensor, pc.src, 0, pc.nbytes);
+            total += pc.nbytes;
+            i = j;
+            continue;
+        }
+
+        // Some model loaders fuse adjacent source tensors (for example Q/K/V)
+        // into one destination. Backends that repack quantized weights need the
+        // complete tensor in a single offset-zero upload, so merge only the
+        // current tensor's pieces and release the temporary buffer immediately.
+        std::vector<uint8_t> merged(tensor_bytes);
+        size_t               expected_offset = 0;
+        for (size_t k = i; k < j; k++) {
+            const auto & pc = wctx->pending[k];
+            if (pc.offset != expected_offset || pc.offset + pc.nbytes > tensor_bytes) {
+                fprintf(stderr, "[WeightCtx] FATAL: invalid segmented upload for '%s'\n", tensor->name);
+                return false;
+            }
+            memcpy(merged.data() + pc.offset, pc.src, pc.nbytes);
+            expected_offset += pc.nbytes;
+            total += pc.nbytes;
+        }
+        if (expected_offset != tensor_bytes) {
+            fprintf(stderr, "[WeightCtx] FATAL: incomplete segmented upload for '%s'\n", tensor->name);
+            return false;
+        }
+        ggml_backend_tensor_set(wctx->pending[i].tensor, merged.data(), 0, tensor_bytes);
+        i = j;
     }
     fprintf(stderr, "[WeightCtx] Loaded %zu tensors, %.1f MB into backend\n", wctx->pending.size(),
             (float) total / (1024 * 1024));
     wctx->pending.clear();
     wctx->staging.clear();
     return true;
+}
+
+static bool wctx_alloc(WeightCtx * wctx, ggml_backend_t backend) {
+    return wctx_alloc_from_buft(wctx, ggml_backend_get_default_buffer_type(backend));
 }
 
 static void wctx_free(WeightCtx * wctx) {

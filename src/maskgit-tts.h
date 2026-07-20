@@ -17,7 +17,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
-#include <cstdio>
 #include <vector>
 
 struct MaskgitConfig {
@@ -147,7 +146,7 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
         return {};
     }
     if (T > S) {
-        fprintf(stderr, "[MaskGIT] FATAL: T=%d exceeds S=%d\n", T, S);
+        ov_log(OV_LOG_ERROR, "[MaskGIT] T=%d exceeds S=%d", T, S);
         return {};
     }
 
@@ -160,11 +159,11 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
 
     uint32_t ctr_lo = (ctr_lo_inout != nullptr) ? *ctr_lo_inout : 0;
 
-    fprintf(
-        stderr,
-        "[MaskGIT] Start: T=%d K=%d S=%d num_step=%d guidance=%.2f t_shift=%.3f layer_pen=%.2f cls_t=%.2f pos_t=%.2f\n",
-        T, K, S, cfg.num_step, (double) cfg.guidance_scale, (double) cfg.t_shift, (double) cfg.layer_penalty_factor,
-        (double) cfg.class_temperature, (double) cfg.position_temperature);
+    ov_log(OV_LOG_INFO,
+           "[MaskGIT] Start: T=%d K=%d S=%d num_step=%d guidance=%.2f t_shift=%.3f layer_pen=%.2f cls_t=%.2f "
+           "pos_t=%.2f",
+           T, K, S, cfg.num_step, (double) cfg.guidance_scale, (double) cfg.t_shift,
+           (double) cfg.layer_penalty_factor, (double) cfg.class_temperature, (double) cfg.position_temperature);
 
     double fwd_total_ms = 0.0;
 
@@ -196,7 +195,26 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
         const size_t per_full_item = (size_t) V * (size_t) K * (size_t) S;
         const size_t expected      = audio_only ? 2 * per_audio : (size_t) B_prime * per_full_item;
         if (logits_full.size() != expected) {
-            fprintf(stderr, "[MaskGIT] FATAL: forward returned %zu f32 (expected %zu)\n", logits_full.size(), expected);
+            ov_log(OV_LOG_ERROR, "[MaskGIT] forward returned %zu f32 (expected %zu)", logits_full.size(), expected);
+            pipeline_tts_llm_batched_ctx_free(pt, &batched_ctx);
+            return {};
+        }
+
+        const size_t row_size   = audio_only ? per_audio : per_full_item;
+        size_t       cond_nan   = 0;
+        size_t       cond_inf   = 0;
+        size_t       uncond_nan = 0;
+        size_t       uncond_inf = 0;
+        for (size_t i = 0; i < row_size; i++) {
+            cond_nan += std::isnan(logits_full[i]) ? 1 : 0;
+            cond_inf += std::isinf(logits_full[i]) ? 1 : 0;
+            uncond_nan += std::isnan(logits_full[row_size + i]) ? 1 : 0;
+            uncond_inf += std::isinf(logits_full[row_size + i]) ? 1 : 0;
+        }
+        if (cond_nan != 0 || cond_inf != 0 || uncond_nan != 0 || uncond_inf != 0) {
+            ov_log(OV_LOG_ERROR,
+                   "[MaskGIT] step %d non-finite LM logits: cond={nan=%zu inf=%zu} uncond={nan=%zu inf=%zu}",
+                   step + 1, cond_nan, cond_inf, uncond_nan, uncond_inf);
             pipeline_tts_llm_batched_ctx_free(pt, &batched_ctx);
             return {};
         }
@@ -219,7 +237,6 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                 std::copy(src_uncond + uncond_off, src_uncond + uncond_off + V, u_log.begin() + dst_off);
             }
         }
-
         // Dump LM logits at step 0 only, layout [K, T, V] for both cond and
         // uncond rows. The Python side mirrors this layout via a hook on
         // _predict_tokens_with_scoring.
@@ -292,7 +309,6 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                 confidence[(size_t) k * T + t] = max_lp;
             }
         }
-
         // Dump pred_tokens and confidence at step 0 only, before the layer
         // penalty so the dump matches Python _predict_tokens_with_scoring.
         if (step == 0 && dump_dir) {
@@ -352,12 +368,12 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
             prompt->input_ids[((size_t) 1 * K + k) * S + (size_t) t]                      = v;
         }
 
-        fprintf(stderr, "[MaskGIT-Step] %d/%d demask=%d remaining=%d\n", step + 1, cfg.num_step, k_demask,
-                (int) std::count(tokens.begin(), tokens.end(), mask_id));
+        ov_log(OV_LOG_INFO, "[MaskGIT-Step] %d/%d demask=%d remaining=%d", step + 1, cfg.num_step, k_demask,
+               (int) std::count(tokens.begin(), tokens.end(), mask_id));
     }
 
-    fprintf(stderr, "[MaskGIT] Total LM forward: %.2f ms across %d steps (avg %.2f ms/step)\n", fwd_total_ms,
-            cfg.num_step, fwd_total_ms / (double) cfg.num_step);
+    ov_log(OV_LOG_INFO, "[MaskGIT] Total LM forward: %.2f ms across %d steps (avg %.2f ms/step)", fwd_total_ms,
+           cfg.num_step, fwd_total_ms / (double) cfg.num_step);
 
     if (ctr_lo_inout != nullptr) {
         *ctr_lo_inout = ctr_lo;

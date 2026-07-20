@@ -80,12 +80,12 @@ endif()
 # Shared compile options and ggml linkage
 macro(link_ggml_backends target)
     target_include_directories(${target} PRIVATE
-        ${CMAKE_SOURCE_DIR}/src
-        ${CMAKE_SOURCE_DIR}
-        ${CMAKE_BINARY_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}
     )
     target_include_directories(${target} SYSTEM PRIVATE
-        ${CMAKE_SOURCE_DIR}/ggml/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/ggml/include
     )
     if(MSVC)
         target_compile_options(${target} PRIVATE /W4 /wd4100 /wd4505)
@@ -192,9 +192,8 @@ else()
     target_compile_options(test-abi-c PRIVATE -Wall -Werror -pedantic)
 endif()
 target_include_directories(test-abi-c PRIVATE
-    ${CMAKE_SOURCE_DIR}/src
-    ${CMAKE_BINARY_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_BINARY_DIR}
 )
 target_link_libraries(test-abi-c PRIVATE omnivoice-core)
 link_ggml_backends(test-abi-c)
-

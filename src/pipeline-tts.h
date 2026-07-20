@@ -3,7 +3,7 @@
 //
 // Owns the LLM weights and exposes load / free plus debug entry points used
 // by tests/*-cossim.py to validate each stage in isolation. Mirrors the
-// layout of pipeline-codec.h: single backend, single shared WeightCtx, one
+// layout of pipeline-codec.h: one primary backend with CPU fallback and one
 // ggml_gallocr per graph at compute time.
 
 #include "backend.h"
@@ -29,8 +29,11 @@ struct PipelineTTS {
     // LLM weights (Qwen3 backbone + audio_embeddings + audio_heads).
     OmniVoiceLM lm;
 
-    // All LLM tensors share this WeightCtx, allocated once at end of load.
+    // Transformer and output-head weights use the selected backend. Quantized
+    // embeddings use a separate CPU context on Hexagon because its Q8_0
+    // GET_ROWS falls back to CPU while HMX stores Q8_0 weights in tiled form.
     WeightCtx wctx;
+    WeightCtx embed_wctx;
 
     // Backend pair (GPU + CPU fallback) and scheduler. The scheduler routes
     // ops to the CPU backend when the GPU does not implement them (typical
@@ -89,27 +92,35 @@ struct MaskgitBatchedCtx {
     const int32_t * audio_mask_raw;
     const int32_t * attn_mask_raw;
 
-    // Static LM graph replayed across the MaskGIT steps. The topology is fixed
-    // within a request, so the graph is built once, allocated once directly when the backend supports every op,
-    // otherwise through the scheduler, and replayed with a fresh input_ids upload per step. lm_key_K
-    // and lm_key_T_audio detect a shape change that forces a rebuild.
-    struct ggml_context * lm_gctx         = nullptr;
-    struct ggml_cgraph *  lm_gf           = nullptr;
-    struct ggml_tensor *  lm_text_ids     = nullptr;
-    struct ggml_tensor *  lm_shifted      = nullptr;
-    struct ggml_tensor *  lm_mask         = nullptr;
-    struct ggml_tensor *  lm_inv_mask     = nullptr;
-    struct ggml_tensor *  lm_positions    = nullptr;
-    struct ggml_tensor *  lm_attn         = nullptr;
-    struct ggml_tensor *  lm_cond_audio   = nullptr;
-    struct ggml_tensor *  lm_uncond_audio = nullptr;
-    struct ggml_tensor *  lm_logits       = nullptr;
+    // Static B=1 LM graph replayed once per CFG row and MaskGIT step. Keeping
+    // cond and uncond as separate replays lets backends that reject a trailing
+    // batch dimension (notably Hexagon quantized MUL_MAT) offload the linear
+    // layers. The graph is allocated once and only its row inputs are replaced.
+    struct ggml_context * lm_gctx          = nullptr;
+    struct ggml_cgraph *  lm_gf            = nullptr;
+    struct ggml_tensor *  lm_text_ids      = nullptr;
+    struct ggml_tensor *  lm_shifted       = nullptr;
+    struct ggml_tensor *  lm_mask          = nullptr;
+    struct ggml_tensor *  lm_inv_mask      = nullptr;
+    struct ggml_tensor *  lm_positions     = nullptr;
+    struct ggml_tensor *  lm_attn          = nullptr;
+    struct ggml_tensor *  lm_text_embeds   = nullptr;
+    struct ggml_tensor *  lm_audio_embeds  = nullptr;
+    struct ggml_tensor *  lm_text_branch   = nullptr;
+    struct ggml_tensor *  lm_audio_branch  = nullptr;
+    struct ggml_tensor *  lm_inputs_embeds = nullptr;
+    struct ggml_tensor *  lm_hidden        = nullptr;
+    struct ggml_tensor *  lm_cond_audio    = nullptr;
+    struct ggml_tensor *  lm_uncond_audio  = nullptr;
+    struct ggml_tensor *  lm_logits        = nullptr;
+    std::vector<struct ggml_tensor *> lm_l0_tensors;
     StaticGraph           lm_graph;
     std::vector<int32_t>  shifted;
     std::vector<int32_t>  text_ids;
-    int                   lm_key_K       = 0;
-    int                   lm_key_T_audio = -1;
-    bool                  lm_built       = false;
+    int                   lm_key_K        = 0;
+    int                   lm_key_T_audio  = -1;
+    bool                  lm_built        = false;
+    bool                  lm_stats_logged = false;
 };
 
 // Pre-compute the batched context from the prompt buffers. The original
@@ -121,7 +132,8 @@ void pipeline_tts_llm_batched_ctx_init(MaskgitBatchedCtx * ctx,
                                        int                 B_prime,
                                        int                 S);
 
-// Batched version: runs B' independent forwards (cond + uncond stacked).
+// CFG version: runs B' independent forwards (cond + uncond) by replaying one
+// B=1 graph. The returned layout remains row-stacked for existing callers.
 // input_ids  [B', K, S]      row-major (b slow, k mid, s fast). Mutates
 //                              between MaskGIT steps as tokens get demasked.
 // ctx                          pre-computed audio_mask / inv / positions /

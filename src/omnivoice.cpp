@@ -256,7 +256,19 @@ struct ov_context * ov_init(const struct ov_init_params * params) {
         }
 
         if (params->codec_path) {
-            if (!pipeline_codec_load(&ov->pc, params->codec_path, ov->bp)) {
+            BackendPair codec_bp = ov->bp;
+            const char * primary_backend = ggml_backend_name(ov->bp.backend);
+            if (primary_backend && strncmp(primary_backend, "HTP", 3) == 0) {
+                // The experimental Hexagon backend is stable for the Qwen LM
+                // matmuls used above, but current v79 kernels crash the user PD
+                // on audio-tokenizer graph shapes. Keep LM weights on HTP and
+                // run the smaller codec on the already-owned CPU fallback.
+                codec_bp.backend     = ov->bp.cpu_backend;
+                codec_bp.cpu_backend = ov->bp.cpu_backend;
+                codec_bp.has_gpu     = false;
+                ov_log(OV_LOG_WARN, "[Load] Codec backend: CPU (HTP codec fallback)");
+            }
+            if (!pipeline_codec_load(&ov->pc, params->codec_path, codec_bp)) {
                 ov_throw("ov_init: pipeline_codec_load failed for '%s'", params->codec_path);
             }
             ov->codec_loaded = true;
