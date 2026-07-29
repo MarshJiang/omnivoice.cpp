@@ -27,6 +27,7 @@
 #include <new>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // Internal definition of the opaque handle. C++ types are fine here
@@ -39,6 +40,16 @@ struct ov_context {
     BPETokenizer  tok;
     VoiceDesign   vd;
     bool          codec_loaded;
+
+    // 0 = idle, 1 = establishing the cancellation baseline, 2 = active.
+    std::atomic<int>      synthesis_state{ 0 };
+    std::atomic<uint64_t> cancellation_epoch{ 0 };
+    std::atomic<uint64_t> synthesis_cancellation_epoch{ 0 };
+    std::atomic<int>  synthesis_stage{ OV_SYNTHESIS_STAGE_IDLE };
+    std::atomic<int>  synthesis_step{ 0 };
+    std::atomic<int>  synthesis_total_steps{ 0 };
+    std::atomic<int>  synthesis_chunk{ 0 };
+    std::atomic<int>  synthesis_total_chunks{ 0 };
 };
 
 // Thread-local backing store for ov_last_error(). std::string sized once
@@ -141,6 +152,29 @@ void ov_log(enum ov_log_level level, const char * fmt, ...) {
     } else {
         std::fprintf(stderr, "%s\n", buf);
     }
+}
+
+static bool ov_context_should_cancel(void * user_data) {
+    auto * ov = static_cast<ov_context *>(user_data);
+    return ov && ov->cancellation_epoch.load(std::memory_order_acquire) !=
+                     ov->synthesis_cancellation_epoch.load(std::memory_order_relaxed);
+}
+
+static void ov_context_update_progress(void *                   user_data,
+                                       enum ov_synthesis_stage stage,
+                                       int                     step,
+                                       int                     total_steps,
+                                       int                     chunk,
+                                       int                     total_chunks) {
+    auto * ov = static_cast<ov_context *>(user_data);
+    if (!ov) {
+        return;
+    }
+    ov->synthesis_step.store(step, std::memory_order_relaxed);
+    ov->synthesis_total_steps.store(total_steps, std::memory_order_relaxed);
+    ov->synthesis_chunk.store(chunk, std::memory_order_relaxed);
+    ov->synthesis_total_chunks.store(total_chunks, std::memory_order_relaxed);
+    ov->synthesis_stage.store(stage, std::memory_order_release);
 }
 
 extern "C" {
@@ -302,6 +336,37 @@ const char * ov_backend_name(const struct ov_context * ov) {
     return ggml_backend_name(ov->bp.backend);
 }
 
+void ov_cancel(struct ov_context * ov) {
+    if (!ov) {
+        return;
+    }
+    int state = ov->synthesis_state.load(std::memory_order_acquire);
+    while (state == 1) {
+        std::this_thread::yield();
+        state = ov->synthesis_state.load(std::memory_order_acquire);
+    }
+    if (state == 2) {
+        ov->cancellation_epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+}
+
+void ov_get_synthesis_progress(const struct ov_context * ov, struct ov_synthesis_progress * out) {
+    if (!out) {
+        return;
+    }
+    if (!ov) {
+        *out = {};
+        out->stage = OV_SYNTHESIS_STAGE_IDLE;
+        return;
+    }
+
+    out->stage        = static_cast<ov_synthesis_stage>(ov->synthesis_stage.load(std::memory_order_acquire));
+    out->step         = ov->synthesis_step.load(std::memory_order_relaxed);
+    out->total_steps  = ov->synthesis_total_steps.load(std::memory_order_relaxed);
+    out->chunk        = ov->synthesis_chunk.load(std::memory_order_relaxed);
+    out->total_chunks = ov->synthesis_total_chunks.load(std::memory_order_relaxed);
+}
+
 enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params * params, struct ov_audio * out) {
     if (!ov || !params) {
         ov_set_error("ov_synthesize: ov / params is NULL");
@@ -334,21 +399,73 @@ enum ov_status ov_synthesize(struct ov_context * ov, const struct ov_tts_params 
         ov_log(OV_LOG_ERROR, "[OmniVoice] ov_synthesize requires a codec-loaded handle");
         return OV_STATUS_INVALID_PARAMS;
     }
+
+    int expected = 0;
+    if (!ov->synthesis_state.compare_exchange_strong(expected, 1, std::memory_order_acq_rel)) {
+        ov_set_error("ov_synthesize: another synthesis is already active on this context");
+        if (out) {
+            ov_audio_free(out);
+        }
+        return OV_STATUS_INVALID_PARAMS;
+    }
+
+    const uint64_t starting_cancellation_epoch = ov->cancellation_epoch.load(std::memory_order_acquire);
+    ov->synthesis_cancellation_epoch.store(starting_cancellation_epoch, std::memory_order_release);
+    ov->synthesis_state.store(2, std::memory_order_release);
+    ov_context_update_progress(ov, OV_SYNTHESIS_STAGE_PREPARING, 0, params->mg_num_step, 0, 0);
+
+    tts_control control = {
+        ov_context_should_cancel,
+        ov_context_update_progress,
+        ov,
+    };
+
+    ov_status status = OV_STATUS_GENERATE_FAILED;
     // Defense in depth: the synthesis path normally reports failures via
     // ov_status return + ov_set_error. A future load-style throw or any
     // std::bad_alloc deep inside the GGML backend is caught here and
     // converted to OV_STATUS_GENERATE_FAILED so an exception never crosses
     // the extern "C" boundary.
     try {
-        return pipeline_tts_synthesize(&ov->pt, &ov->pc, &ov->tok, &ov->vd, params, out);
+        status = pipeline_tts_synthesize(&ov->pt, &ov->pc, &ov->tok, &ov->vd, params, out, &control);
     } catch (const std::exception & e) {
         ov_set_error("%s", e.what());
         ov_log(OV_LOG_ERROR, "[OmniVoice] %s", e.what());
         if (out) {
             ov_audio_free(out);
         }
-        return OV_STATUS_GENERATE_FAILED;
+        status = OV_STATUS_GENERATE_FAILED;
+    } catch (...) {
+        ov_set_error("ov_synthesize: unknown native exception");
+        ov_log(OV_LOG_ERROR, "[OmniVoice] unknown native synthesis exception");
+        if (out) {
+            ov_audio_free(out);
+        }
+        status = OV_STATUS_GENERATE_FAILED;
     }
+
+    if (status == OV_STATUS_OK && ov_context_should_cancel(ov)) {
+        if (out) {
+            ov_audio_free(out);
+        }
+        status = OV_STATUS_CANCELLED;
+    }
+
+    enum ov_synthesis_stage final_stage = OV_SYNTHESIS_STAGE_FAILED;
+    if (status == OV_STATUS_OK) {
+        final_stage = OV_SYNTHESIS_STAGE_COMPLETE;
+    } else if (status == OV_STATUS_CANCELLED) {
+        final_stage = OV_SYNTHESIS_STAGE_CANCELLED;
+    }
+    ov_context_update_progress(
+        ov,
+        final_stage,
+        ov->synthesis_step.load(std::memory_order_relaxed),
+        ov->synthesis_total_steps.load(std::memory_order_relaxed),
+        ov->synthesis_chunk.load(std::memory_order_relaxed),
+        ov->synthesis_total_chunks.load(std::memory_order_relaxed));
+    ov->synthesis_state.store(0, std::memory_order_release);
+    return status;
 }
 
 int ov_duration_sec_to_tokens(const struct ov_context * ov, float duration_sec) {

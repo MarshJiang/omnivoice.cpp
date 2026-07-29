@@ -79,6 +79,16 @@ int main(void) {
     struct ov_audio audio = { 0 };
     ov_audio_free(&audio);
 
+    struct ov_synthesis_progress progress = { 0 };
+    ov_cancel(NULL);
+    ov_get_synthesis_progress(NULL, &progress);
+    ov_get_synthesis_progress(NULL, NULL);
+    if (progress.stage != OV_SYNTHESIS_STAGE_IDLE || progress.step != 0 || progress.total_steps != 0 ||
+        progress.chunk != 0 || progress.total_chunks != 0) {
+        fprintf(stderr, "[Probe] NULL synthesis progress was not idle and zeroed\n");
+        return 11;
+    }
+
     struct ov_voice_ref voice_ref = { 0 };
     ov_voice_ref_free(&voice_ref);
 

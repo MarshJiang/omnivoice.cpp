@@ -160,6 +160,32 @@ std::vector<float> pipeline_tts_llm_forward_batched(PipelineTTS *       pt,
 // Safe to call on a context that never built a graph.
 void pipeline_tts_llm_batched_ctx_free(PipelineTTS * pt, MaskgitBatchedCtx * ctx);
 
+// Per-call control supplied by the public ov_context wrapper. The native
+// pipeline also preserves ov_tts_params.cancel; either source may request
+// cancellation. progress is optional and may run on the synthesis thread.
+struct tts_control {
+    ov_cancel_cb cancel;
+    void (*progress)(void * user_data,
+                     enum ov_synthesis_stage stage,
+                     int step,
+                     int total_steps,
+                     int chunk,
+                     int total_chunks);
+    void * user_data;
+};
+
+struct tts_cancel {
+    ov_cancel_cb        caller_cancel;
+    void *              caller_user_data;
+    const tts_control * control;
+    bool                triggered;
+    int                 chunk;
+    int                 total_chunks;
+};
+
+bool tts_should_cancel(tts_cancel * cc);
+void tts_report_progress(tts_cancel * cc, enum ov_synthesis_stage stage, int step, int total_steps);
+
 // Low-level token generator: tokenize text, build prompt + CFG batch, run
 // the MaskGIT iterative decoder. Returns flat audio_tokens of size K * T (k
 // slow, t fast) or an empty vector on failure. ref_text and ref_audio_tokens
@@ -183,7 +209,8 @@ std::vector<int32_t> pipeline_tts_generate(PipelineTTS *         pt,
                                            const int32_t *       ref_audio_tokens,
                                            int                   ref_T,
                                            const char *          dump_dir,
-                                           uint32_t *            ctr_lo_inout = nullptr);
+                                           uint32_t *            ctr_lo_inout = nullptr,
+                                           tts_cancel *          cancel       = nullptr);
 
 // Validate and normalise the raw instruct string against the voice-design
 // vocabulary. The target language is selected from the synthesis text: any
@@ -218,4 +245,5 @@ ov_status pipeline_tts_synthesize(PipelineTTS *         pt,
                                   const BPETokenizer *  tok,
                                   const VoiceDesign *   vd,
                                   const ov_tts_params * params,
-                                  ov_audio *            out);
+                                  ov_audio *            out,
+                                  const tts_control *   control = nullptr);

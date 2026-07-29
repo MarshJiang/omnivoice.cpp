@@ -133,9 +133,41 @@ OV_API void ov_free(struct ov_context * ov);
 // alive; callers must not free it.
 OV_API const char * ov_backend_name(const struct ov_context * ov);
 
+// Observable synthesis state for polling bindings. Progress is owned by the
+// context and updated atomically, so callers may query it from a different
+// thread while ov_synthesize is running.
+enum ov_synthesis_stage {
+    OV_SYNTHESIS_STAGE_IDLE           = 0,
+    OV_SYNTHESIS_STAGE_PREPARING      = 1,
+    OV_SYNTHESIS_STAGE_GENERATING     = 2,
+    OV_SYNTHESIS_STAGE_DECODING       = 3,
+    OV_SYNTHESIS_STAGE_POSTPROCESSING = 4,
+    OV_SYNTHESIS_STAGE_COMPLETE       = 5,
+    OV_SYNTHESIS_STAGE_CANCELLED      = 6,
+    OV_SYNTHESIS_STAGE_FAILED         = 7,
+};
+
+struct ov_synthesis_progress {
+    enum ov_synthesis_stage stage;
+    int                     step;
+    int                     total_steps;
+    int                     chunk;
+    int                     total_chunks;
+};
+
+// Request cooperative cancellation of the active synthesis. Safe to call
+// from another thread and safe on NULL. The flag is reset at the beginning
+// of the next ov_synthesize call, so cancelling does not unload the model or
+// poison subsequent synthesis attempts.
+OV_API void ov_cancel(struct ov_context * ov);
+
+// Copy the latest synthesis progress into out. Safe to call concurrently
+// with ov_synthesize. A NULL context reports IDLE with zero counters; a NULL
+// output is ignored.
+OV_API void ov_get_synthesis_progress(const struct ov_context * ov, struct ov_synthesis_progress * out);
+
 // Cooperative cancellation callback. Returns true to request the
-// synthesis to abort. Polled between chunks of long-form output, so the
-// cancel granularity is roughly chunk_duration_sec.
+// synthesis to abort. Polled between MaskGIT steps and long-form chunks.
 typedef bool (*ov_cancel_cb)(void * user_data);
 
 // Streaming output callback. When set on ov_tts_params, the synth pipeline

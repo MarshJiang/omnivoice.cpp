@@ -136,7 +136,8 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
                                              const MaskgitConfig & cfg,
                                              int                   T,
                                              const char *          dump_dir     = nullptr,
-                                             uint32_t *            ctr_lo_inout = nullptr) {
+                                             uint32_t *            ctr_lo_inout = nullptr,
+                                             tts_cancel *          cancel       = nullptr) {
     const int K       = prompt->K;
     const int B_prime = prompt->B_prime;
     const int S       = prompt->S_max;
@@ -173,10 +174,18 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
     MaskgitBatchedCtx batched_ctx;
     pipeline_tts_llm_batched_ctx_init(&batched_ctx, prompt->audio_mask.data(), prompt->attention_mask.data(), B_prime,
                                       S);
+    tts_report_progress(cancel, OV_SYNTHESIS_STAGE_GENERATING, 0, cfg.num_step);
 
     for (int step = 0; step < cfg.num_step; step++) {
+        if (tts_should_cancel(cancel)) {
+            ov_log(OV_LOG_INFO, "[MaskGIT] Cancelled before step %d/%d", step + 1, cfg.num_step);
+            pipeline_tts_llm_batched_ctx_free(pt, &batched_ctx);
+            return {};
+        }
+
         int k_demask = sched[step];
         if (k_demask <= 0) {
+            tts_report_progress(cancel, OV_SYNTHESIS_STAGE_GENERATING, step + 1, cfg.num_step);
             continue;
         }
 
@@ -370,6 +379,7 @@ static std::vector<int32_t> maskgit_generate(PipelineTTS *         pt,
 
         ov_log(OV_LOG_INFO, "[MaskGIT-Step] %d/%d demask=%d remaining=%d", step + 1, cfg.num_step, k_demask,
                (int) std::count(tokens.begin(), tokens.end(), mask_id));
+        tts_report_progress(cancel, OV_SYNTHESIS_STAGE_GENERATING, step + 1, cfg.num_step);
     }
 
     ov_log(OV_LOG_INFO, "[MaskGIT] Total LM forward: %.2f ms across %d steps (avg %.2f ms/step)", fwd_total_ms,
