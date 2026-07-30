@@ -35,9 +35,22 @@ static int backend_cpu_n_threads(void) {
 // Android reports physical cores rather than SMT siblings. Codec graphs run
 // entirely on CPU while HTP is idle, so they can use all available cores.
 static int backend_codec_cpu_n_threads(void) {
+    int max_threads = (int) std::thread::hardware_concurrency();
+    if (max_threads <= 0) {
+        max_threads = 1;
+    }
+
+    const char * value = std::getenv("OMNIVOICE_CODEC_THREADS");
+    if (value) {
+        char * end = nullptr;
+        long   n   = std::strtol(value, &end, 10);
+        if (end != value && *end == '\0' && n > 0) {
+            return (int) (n < max_threads ? n : max_threads);
+        }
+    }
+
 #if defined(__ANDROID__)
-    int n = (int) std::thread::hardware_concurrency();
-    return n > 0 ? n : 1;
+    return max_threads;
 #else
     return backend_cpu_n_threads();
 #endif
