@@ -77,6 +77,7 @@ struct DACDecoder {
     // Storage for the weight tensors (separate from the inference graph ctx).
     struct ggml_context * weight_ctx;
     ggml_backend_buffer_t weight_buf;
+    bool                  use_f16_conv_transpose;
 };
 
 // Load a 1D-along-channel alpha tensor (stored shape (1, C, 1)) as f32 [C],
@@ -210,6 +211,8 @@ static bool dac_load(DACDecoder * d, const GGUFModel & gf, ggml_backend_t backen
     static const int in_chs[]    = DAC_BLOCK_IN_CH;
     static const int out_chs[]   = DAC_BLOCK_OUT_CH;
     static const int dilations[] = DAC_RU_DILATIONS;
+    const char *     backend_name = ggml_backend_name(backend);
+    d->use_f16_conv_transpose = backend_name && strncmp(backend_name, "HTP", 3) == 0;
 
     // Phase 1: describe all tensors in a no_alloc context
     const int               n_tensors_max = 256;
@@ -347,9 +350,13 @@ static struct ggml_tensor * dac_conv_t1d(struct ggml_context * ctx,
                                          int                   stride,
                                          int                   pad,
                                          int                   oc,
-                                         int                   output_pad) {
+                                         int                   output_pad,
+                                         bool                  use_f16_activation) {
     // 1. transpose x: [T_in, IC] -> [IC, T_in] (contiguous copy)
     struct ggml_tensor * xt = ggml_cont(ctx, ggml_transpose(ctx, x));
+    if (use_f16_activation) {
+        xt = ggml_cast(ctx, xt, GGML_TYPE_F16);
+    }
 
     // 2. mul_mat contracts over IC: col [K*OC, T_in]
     struct ggml_tensor * col = ggml_mul_mat(ctx, w, xt);
@@ -408,7 +415,8 @@ static struct ggml_tensor * dac_build_graph(struct ggml_context *               
     for (int i = 0; i < DAC_NUM_BLOCKS; i++) {
         const DACBlock & b = d->blk[i];
         x                  = dac_snake(ctx, x, b.s1);
-        x                  = dac_conv_t1d(ctx, b.ctw, b.ctb, x, b.stride, b.pad, b.out_ch, b.output_pad);
+        x = dac_conv_t1d(ctx, b.ctw, b.ctb, x, b.stride, b.pad, b.out_ch, b.output_pad,
+                         d->use_f16_conv_transpose);
         for (int r = 0; r < DAC_RES_UNITS; r++) {
             x = dac_res_unit(ctx, &b.ru[r], x);
         }
